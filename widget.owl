@@ -24,7 +24,7 @@ widget "photo" {
 mkdir -p ~/.cache/omalauncher-photos
 cat > "$f.tmp" <<'OWL_PY'
 #!/usr/bin/env python3
-import sys, os, re, hashlib, subprocess, json, shutil
+import sys, os, re, hashlib, subprocess, json, shutil, urllib.parse
 from pathlib import Path
 
 HOME = Path.home()
@@ -156,9 +156,9 @@ def normalize_url(url: str) -> str:
     if url.startswith("www."):
         url = "https://" + url
     elif not url.startswith("http://") and not url.startswith("https://") and not url.startswith("/") and not url.startswith("~"):
-        if "." in url and not url.endswith((".jpg", ".jpeg", ".png", ".webp", ".gif")):
+        if "." in url and not url.startswith("/"):
             url = "https://" + url
-    m = re.search(r"drive\.google\.com/file/d/([a-zA-Z0-9_-]+)", url)
+    m = re.search(r"drive\.google\.com/(?:file/d/|open\?id=)([a-zA-Z0-9_-]+)", url)
     if m:
         return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
     if "dropbox.com" in url and "dl=0" in url:
@@ -166,7 +166,113 @@ def normalize_url(url: str) -> str:
     m = re.match(r"^https?://(?:www\.)?imgur\.com/([a-zA-Z0-9]{5,8})$", url)
     if m:
         return f"https://i.imgur.com/{m.group(1)}.jpg"
+    m = re.match(r"^https?://github\.com/([^/]+)/([^/]+)/blob/(.+)$", url)
+    if m:
+        return f"https://raw.githubusercontent.com/{m.group(1)}/{m.group(2)}/{m.group(3)}"
     return url
+
+def extract_image_from_html(html_text: str, base_url: str = "") -> str:
+    patterns = [
+        r"<meta\s+[^>]*property=[\x27\"]og:image:secure_url[\x27\"][^>]*content=[\x27\"]([^\x27\"]+)[\x27\"]",
+        r"<meta\s+[^>]*property=[\x27\"]og:image[\x27\"][^>]*content=[\x27\"]([^\x27\"]+)[\x27\"]",
+        r"<meta\s+[^>]*content=[\x27\"]([^\x27\"]+)[\x27\"][^>]*property=[\x27\"]og:image[\x27\"]",
+        r"<meta\s+[^>]*name=[\x27\"]twitter:image(?::src)?[\x27\"][^>]*content=[\x27\"]([^\x27\"]+)[\x27\"]",
+        r"<meta\s+[^>]*content=[\x27\"]([^\x27\"]+)[\x27\"][^>]*name=[\x27\"]twitter:image(?::src)?[\x27\"]",
+        r"<link\s+[^>]*rel=[\x27\"]image_src[\x27\"][^>]*href=[\x27\"]([^\x27\"]+)[\x27\"]",
+        r"<meta\s+[^>]*itemprop=[\x27\"]image[\x27\"][^>]*content=[\x27\"]([^\x27\"]+)[\x27\"]",
+    ]
+    for pat in patterns:
+        m = re.search(pat, html_text, re.IGNORECASE)
+        if m:
+            img_url = m.group(1).replace("&amp;", "&").strip()
+            if base_url:
+                img_url = urllib.parse.urljoin(base_url, img_url)
+            return img_url
+    return ""
+
+def download_url_to_file(url_to_get: str, target_file: Path) -> bool:
+    try:
+        tmp = target_file.with_suffix(".tmp")
+        cmd = ["curl", "-f", "-sL", "-A", USER_AGENT, "--compressed", "--max-time", "20", "--retry", "2", "-o", str(tmp), url_to_get]
+        res = subprocess.run(cmd, capture_output=True)
+        if res.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, target_file)
+            return True
+        if tmp.exists():
+            try: tmp.unlink()
+            except Exception: pass
+    except Exception:
+        pass
+    return False
+
+def fetch_web_photo(norm_url: str, dest: Path) -> str:
+    raw_tmp = dest.with_suffix(".raw")
+    if not download_url_to_file(norm_url, raw_tmp):
+        return ""
+    
+    is_img = False
+    if HAS_PIL:
+        try:
+            with Image.open(raw_tmp) as im:
+                if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                    rgb = Image.new("RGB", im.size, (255, 255, 255))
+                    rgb.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[3])
+                    rgb.save(dest, "JPEG", quality=92)
+                else:
+                    im.convert("RGB").save(dest, "JPEG", quality=92)
+            is_img = True
+        except Exception:
+            is_img = False
+    else:
+        try:
+            header = raw_tmp.read_bytes()[:16]
+            if header.startswith(b"\xff\xd8") or header.startswith(b"\x89PNG") or header.startswith(b"RIFF") or header.startswith(b"GIF8"):
+                shutil.copyfile(raw_tmp, dest)
+                is_img = True
+        except Exception:
+            pass
+
+    if is_img:
+        try: raw_tmp.unlink()
+        except Exception: pass
+        return str(dest.resolve())
+
+    try:
+        content = raw_tmp.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        content = ""
+    
+    try: raw_tmp.unlink()
+    except Exception: pass
+
+    if content:
+        img_url = extract_image_from_html(content, base_url=norm_url)
+        if img_url and img_url != norm_url:
+            if download_url_to_file(img_url, raw_tmp):
+                if HAS_PIL:
+                    try:
+                        with Image.open(raw_tmp) as im:
+                            if im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info):
+                                rgb = Image.new("RGB", im.size, (255, 255, 255))
+                                rgb.paste(im.convert("RGBA"), mask=im.convert("RGBA").split()[3])
+                                rgb.save(dest, "JPEG", quality=92)
+                            else:
+                                im.convert("RGB").save(dest, "JPEG", quality=92)
+                        try: raw_tmp.unlink()
+                        except Exception: pass
+                        return str(dest.resolve())
+                    except Exception:
+                        pass
+                else:
+                    shutil.copyfile(raw_tmp, dest)
+                    try: raw_tmp.unlink()
+                    except Exception: pass
+                    return str(dest.resolve())
+
+    if raw_tmp.exists():
+        try: raw_tmp.unlink()
+        except Exception: pass
+    return ""
 
 def resolve_or_fetch(raw_val: str) -> str:
     raw_val = (raw_val or "").strip()
@@ -174,7 +280,23 @@ def resolve_or_fetch(raw_val: str) -> str:
     expanded = Path(os.path.expanduser(raw_val))
     if expanded.is_file() and expanded.stat().st_size > 0:
         return str(expanded.resolve())
-    if raw_val.startswith("/storage/") or raw_val.startswith("/sdcard/") or raw_val.startswith("content://") or (not raw_val.startswith("http://") and not raw_val.startswith("https://")):
+    norm_url = normalize_url(raw_val)
+    if norm_url.startswith("http://") or norm_url.startswith("https://"):
+        url_hash = hashlib.md5(norm_url.encode()).hexdigest()[:16]
+        dest = DL_DIR / f"photo_{url_hash}.jpg"
+        if dest.exists() and dest.stat().st_size > 0:
+            if HAS_PIL:
+                try:
+                    with Image.open(dest) as im:
+                        im.verify()
+                    return str(dest.resolve())
+                except Exception:
+                    try: dest.unlink()
+                    except Exception: pass
+            else:
+                return str(dest.resolve())
+        return fetch_web_photo(norm_url, dest)
+    if raw_val.startswith("/storage/") or raw_val.startswith("/sdcard/") or raw_val.startswith("content://"):
         fname = Path(raw_val).name
         search_dirs = [
             Path("/storage/emulated/0/Pictures"),
@@ -190,16 +312,6 @@ def resolve_or_fetch(raw_val: str) -> str:
                 for f in sdir.glob(f"**/{fname}"):
                     if f.is_file() and f.stat().st_size > 0:
                         return str(f.resolve())
-    norm_url = normalize_url(raw_val)
-    if norm_url.startswith("http://") or norm_url.startswith("https://"):
-        url_hash = hashlib.md5(norm_url.encode()).hexdigest()[:16]
-        dest = DL_DIR / f"photo_{url_hash}.jpg"
-        if dest.exists() and dest.stat().st_size > 0:
-            return str(dest.resolve())
-        cmd = ["curl", "-sL", "-A", USER_AGENT, "--compressed", "--max-time", "20", "--retry", "2", "-o", str(dest), norm_url]
-        res = subprocess.run(cmd, capture_output=True)
-        if res.returncode == 0 and dest.exists() and dest.stat().st_size > 0:
-            return str(dest.resolve())
     return ""
 
 def cmd_fetch(raw_val="", fallback="", widget_file="market-zyanmd-photo.owl"):
@@ -207,24 +319,23 @@ def cmd_fetch(raw_val="", fallback="", widget_file="market-zyanmd-photo.owl"):
     if res:
         set_status("OK")
         cmd_register_photo(widget_file, res)
-        print(res)
+        print(res.strip())
     else:
         if raw_val:
             set_status("Gagal mengunduh URL / file tidak ditemukan")
         else:
             set_status("OK")
-        print(fallback)
+        print((fallback or "").strip())
 
 def cmd_register_photo(filename="", photo_path=""):
     filename = Path(filename or "").name
     if not filename: return
     registry = load_registry()
     if photo_path:
-        registry[filename] = photo_path
+        registry[filename] = photo_path.strip()
     else:
         registry.pop(filename, None)
     save_registry(registry)
-    print("ok")
 
 def cmd_list_widgets():
     registry = load_registry()
@@ -372,7 +483,9 @@ if __name__ == "__main__":
     elif action == "list_widgets": cmd_list_widgets()
     elif action == "add_widget": cmd_add_widget(sys.argv[2] if len(sys.argv) > 2 else "")
     elif action == "remove_widget": cmd_remove_widget(sys.argv[2] if len(sys.argv) > 2 else "")
-    elif action == "register": cmd_register_photo(sys.argv[2] if len(sys.argv) > 2 else "", sys.argv[3] if len(sys.argv) > 3 else "")
+    elif action == "register":
+        cmd_register_photo(sys.argv[2] if len(sys.argv) > 2 else "", sys.argv[3] if len(sys.argv) > 3 else "")
+        print("ok")
 OWL_PY
 mv -f "$f.tmp" "$f"
 python3 "$f" gallery
@@ -411,21 +524,30 @@ python3 "$f" gallery
   state photoFit = "cover" persist
   state galleryPage = 0
 
+  let cleanActivePhoto = (activePhoto != "" && activePhoto != null) ? trim(last(lines(activePhoto))) : ""
   let totalAlbum = len(album)
   let isSlideshow = totalAlbum > 1
   let slideIndex = isSlideshow ? (floor(now / slideSpeed) % totalAlbum) : 0
-  let curSlidePath = isSlideshow ? album[slideIndex] : ((activePhoto != "" && activePhoto != null) ? activePhoto : defaultPhoto)
-  let currentSrc = isSlideshow ? curSlidePath : ((activePhoto != "" && activePhoto != null) ? activePhoto : defaultPhoto)
+  let curSlidePath = isSlideshow ? trim(last(lines(album[slideIndex]))) : (cleanActivePhoto != "" ? cleanActivePhoto : defaultPhoto)
+  let currentSrc = isSlideshow ? curSlidePath : (cleanActivePhoto != "" ? cleanActivePhoto : defaultPhoto)
   let isFetching = (requestPhoto ?? "") != "" || (requestAlbumPhoto ?? "") != ""
 
+  when startsWith(activePhoto ?? "", "ok") {
+    activePhoto = trim(last(lines(activePhoto)))
+  }
+
+  when any(album ?? [], x => startsWith(x, "ok")) {
+    album = map(album, x => trim(last(lines(x))))
+  }
+
   when (requestPhoto ?? "") != "" {
-    activePhoto = run("python3 ~/.cache/omalauncher-photos/helper.py fetch ${sh(requestPhoto)} ${sh(activePhoto)} ${sh(widgetFile)}")
+    activePhoto = run("python3 ~/.cache/omalauncher-photos/helper.py fetch ${sh(requestPhoto)} ${sh(cleanActivePhoto)} ${sh(widgetFile)}")
     requestPhoto = ""
   }
 
   when (requestAlbumPhoto ?? "") != "" {
     fetchedAlbumPhoto = run("python3 ~/.cache/omalauncher-photos/helper.py fetch ${sh(requestAlbumPhoto)} '' ${sh(widgetFile)}")
-    album = fetchedAlbumPhoto != "" ? take(unique(album + [fetchedAlbumPhoto]), 10) : album
+    album = fetchedAlbumPhoto != "" ? take(unique(album + [trim(last(lines(fetchedAlbumPhoto)))]), 10) : album
     requestAlbumPhoto = ""
   }
 
@@ -442,19 +564,20 @@ python3 "$f" gallery
 
     if isSlideshow {
       for p in album key p {
-        let isCur = p == curSlidePath
+        let cleanP = trim(last(lines(p)))
+        let isCur = cleanP == curSlidePath
         Box {
           fill: true
           opacity: isCur ? 1 : 0
           animate opacity: tween(800ms, "ease")
           if photoFit == "contain" {
-            Image { src: p; fill: true; fit: contain }
+            Image { src: cleanP; fill: true; fit: contain }
           } else {
-            Image { src: p; fill: true; fit: cover }
+            Image { src: cleanP; fill: true; fit: cover }
           }
         }
       }
-    } else if activePhoto != "" && activePhoto != null {
+    } else if cleanActivePhoto != "" {
       if photoFit == "contain" {
         Image {
           src: currentSrc
@@ -528,7 +651,7 @@ python3 "$f" gallery
           border: 1.5
           borderColor: accent
 
-          if (isSlideshow || (activePhoto != "" && activePhoto != null)) {
+          if (isSlideshow || cleanActivePhoto != "") {
             if photoFit == "contain" {
               Image { src: currentSrc; fill: true; fit: contain }
             } else {
@@ -563,7 +686,7 @@ python3 "$f" gallery
             }
           }
           Text {
-            text: isSlideshow ? "Rotasi ${totalAlbum} foto tiap ${slideSpeed}s (Slide ${slideIndex + 1}/${totalAlbum})" : (activePhoto != "" ? activePhoto : (widgetIndex == 1 ? "Foto Default (zyanmd)" : "Belum ada foto dipilih"))
+            text: isSlideshow ? "Rotasi ${totalAlbum} foto tiap ${slideSpeed}s (Slide ${slideIndex + 1}/${totalAlbum})" : (cleanActivePhoto != "" ? cleanActivePhoto : (widgetIndex == 1 ? "Foto Default (zyanmd)" : "Belum ada foto dipilih"))
             style: small
             color: muted
             maxLines: 1
@@ -582,7 +705,7 @@ python3 "$f" gallery
                   haptic()
                 }
               }
-            } else if activePhoto != "" {
+            } else if cleanActivePhoto != "" {
               Button {
                 text: "↺ Reset"
                 onTap: {
@@ -743,12 +866,13 @@ python3 "$f" gallery
               radius: 6 * (corners ?? 1)
               gap: 8
 
+              let cleanItem = trim(last(lines(item)))
               Box {
                 size: 36
                 radius: 4 * (corners ?? 1)
                 clip: true
                 background: alpha(surface, 0.9)
-                Image { src: item; fill: true; fit: cover }
+                Image { src: cleanItem; fill: true; fit: cover }
               }
 
               Text {
@@ -952,7 +1076,7 @@ python3 "$f" gallery
 
         for p in pagedPhotos key p.path {
           let inAlbum = any(album, x => x == p.path)
-          let isSingleActive = activePhoto == p.path && !isSlideshow
+          let isSingleActive = cleanActivePhoto == p.path && !isSlideshow
 
           Column {
             fill: width
@@ -1130,6 +1254,7 @@ python3 "$f" gallery
           onChange: inputUrl = value
           onSubmit: {
             requestPhoto = value != "" ? value : requestPhoto
+            inputUrl = ""
             haptic()
           }
         }
@@ -1144,6 +1269,7 @@ python3 "$f" gallery
             onTap: {
               album = inputUrl != "" ? [] : album
               requestPhoto = inputUrl != "" ? inputUrl : requestPhoto
+              inputUrl = ""
               haptic()
             }
           }
